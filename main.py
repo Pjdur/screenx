@@ -126,7 +126,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 def start_server(ip):
     try:
         server = ThreadedHTTPServer(("0.0.0.0", PORT), StreamHandler)
-        print(f"ScreenX streaming at: http://{ip}>:{PORT}")
+        print(f"ScreenX streaming at: http://{ip}:{PORT}")
         server.serve_forever()
     except Exception:
         pass
