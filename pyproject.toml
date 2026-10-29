@@ -1,9 +1,9 @@
 [project]
 name = "screenx"
 version = "0.1.0"
-description = "Add your description here"
+description = "Stream a computer's screen to any browser on the network over MJPEG"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "mss>=10.2.0",
     "pillow>=13.0.0",

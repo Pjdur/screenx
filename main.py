@@ -1,9 +1,15 @@
-import time
-import sys
-import io
+"""ScreenX - stream this computer's screen to any browser on the network as MJPEG."""
+
+import argparse
 import ctypes
+import io
+import socket
+import sys
+import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
+
 import mss
 from PIL import Image
 
@@ -16,7 +22,9 @@ except Exception:
     except Exception:
         pass
 
-PORT = 8000
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8000
+
 
 class StreamHandler(SimpleHTTPRequestHandler):
     """Serves the live MJPEG ScreenX desktop/game stream using mss for high-speed capture."""
@@ -28,15 +36,11 @@ class StreamHandler(SimpleHTTPRequestHandler):
         super().log_error(format, *args)
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.end_headers()
-            
-            html = """<html><head><meta charset='UTF-8'><title>ScreenX - Live Stream</title>
+        path = urlparse(self.path).path
+        if path == "/" or path == "/index.html":
+            html = """<html><head><meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>ScreenX - Live Stream</title>
 <style>
 :root { 
     --bg: #0f172a; 
@@ -83,21 +87,29 @@ window.addEventListener('DOMContentLoaded', () => {
 </header>
 <div class='stream-wrapper'>
   <div class='stream-container'>
-    <img src='/stream'>
+    <img src='/stream' alt='Live desktop stream'>
   </div>
 </div>
 </body></html>"""
-            self.wfile.write(html.encode('utf-8'))
+            body = html.encode('utf-8')
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(body)
 
-        elif self.path == "/stream":
+        elif path == "/stream":
             self.send_response(200)
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
             self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
             self.end_headers()
             try:
-                # Initialize mss once per stream session for maximum performance
-                with mss.mss() as sct:
-                    monitor = sct.monitors[1]  # Primary monitor (use sct.monitors[0] for all monitors)
+                # mss sessions are not thread-safe, so each viewer gets its own capture session.
+                with mss.MSS() as sct:
+                    monitor = sct.monitors[1]  # First physical display; monitors[0] spans all displays
                     while True:
                         sct_img = sct.grab(monitor)
                         # Efficiently convert mss raw BGRA bytes into a PIL Image
@@ -114,10 +126,18 @@ window.addEventListener('DOMContentLoaded', () => {
                         self.wfile.write(b'\r\n')
                         self.wfile.flush()
                         time.sleep(0.015)  # Faster frame pacing enabled by mss speed
-            except Exception:
-                pass
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                pass  # viewer closed the tab or the network dropped
+            except Exception as exc:
+                print(f"ScreenX: stream error: {exc!r}", file=sys.stderr)
+
+        elif path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+
         else:
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
     def log_message(self, format, *args):
@@ -127,18 +147,79 @@ window.addEventListener('DOMContentLoaded', () => {
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """Handle requests concurrently to support streaming."""
     daemon_threads = True
+    # On Windows, SO_REUSEADDR lets a second process bind an already-used port, silently
+    # splitting traffic between two servers. Fail loudly there; keep the POSIX default.
+    allow_reuse_address = sys.platform != "win32"
 
-def start_server(ip):
+
+def _lan_addresses():
+    """Best-effort list of non-loopback IPv4 addresses for this machine."""
+    addresses = set()
+
+    # Connecting a UDP socket picks the default route's interface without sending traffic.
     try:
-        server = ThreadedHTTPServer(("0.0.0.0", PORT), StreamHandler)
-        print(f"ScreenX streaming at: http://{ip}:{PORT}")
-        server.serve_forever()
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 1))  # TEST-NET-1, reserved and unroutable
+            addresses.add(sock.getsockname()[0])
+    except OSError:
         pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            addresses.add(info[4][0])
+    except OSError:
+        pass
+
+    return sorted(addr for addr in addresses if not addr.startswith("127."))
+
+
+def print_urls(host, port):
+    if host in ("", "0.0.0.0", "::"):
+        print(f"ScreenX streaming at: http://localhost:{port}", flush=True)
+        for addr in _lan_addresses():
+            print(f"                  or: http://{addr}:{port}", flush=True)
+        print("Viewers on your network need the second URL. The stream has no authentication.", flush=True)
+    else:
+        print(f"ScreenX streaming at: http://{host}:{port}", flush=True)
+
+
+def start_server(host, port):
+    try:
+        server = ThreadedHTTPServer((host, port), StreamHandler)
+    except OSError as exc:
+        print(f"ScreenX: cannot listen on {host}:{port} ({exc}).", file=sys.stderr, flush=True)
+        print("Is ScreenX already running? Try a different port, e.g. --port 8001.", file=sys.stderr, flush=True)
+        return 1
+
+    print_urls(host, port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nScreenX stopped.")
+    finally:
+        server.server_close()
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="screenx",
+        description="Stream this computer's screen to any browser on the network.",
+    )
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help=f"interface to bind (default: {DEFAULT_HOST}, all interfaces)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"port to listen on (default: {DEFAULT_PORT})",
+    )
+    args = parser.parse_args(argv)
+    return start_server(args.host, args.port)
 
 
 if __name__ == "__main__":
-    try:
-        start_server("localhost")
-    except KeyboardInterrupt:
-        sys.exit(0)
+    sys.exit(main())
